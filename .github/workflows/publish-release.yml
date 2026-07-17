@@ -1,0 +1,73 @@
+name: Publish Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, verify and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+
+      - name: Build and verify APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug testDebugUnitTest lintDebug
+
+      - name: Prepare release files
+        shell: bash
+        run: |
+          mkdir -p release
+          apk="giffgaff-keepalive-${GITHUB_REF_NAME}-debug.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "release/${apk}"
+          cd release
+          sha256sum "${apk}" > "${apk}.sha256"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES: |
+            ## 本版内容
+
+            - 默认目标为 Google Public DNS `8.8.8.8`
+            - 固定使用 UDP 53，每次点击只发送一个 17 字节 DNS 查询
+            - 只申请非 VPN 蜂窝网络，不回退 Wi-Fi，不自动重试
+            - 界面精简为四条提醒、一个公网 IP 输入框和一个发送按钮
+
+            ## 安装
+
+            下载下方 APK 后直接侧载安装。`.sha256` 文件可用于校验下载完整性。
+
+            这是 GitHub Actions 生成的 debug 签名 APK。如果无法覆盖安装其他构建生成的旧版，请先卸载旧版。
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            release/*.apk \
+            release/*.sha256 \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "giffgaff 保号 ${GITHUB_REF_NAME}" \
+            --notes "${RELEASE_NOTES}"
