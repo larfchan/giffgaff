@@ -35,10 +35,31 @@ jobs:
         with:
           cache-provider: basic
 
-      - name: Build and verify
+      - name: Compile debug APK
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon lintDebug testDebugUnitTest assembleDebug
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Run unit tests
+        run: ./gradlew --no-daemon testDebugUnitTest
+
+      - name: Run Android lint
+        id: lint
+        continue-on-error: true
+        run: ./gradlew --no-daemon lintDebug
+
+      - name: Report lint errors
+        if: steps.lint.outcome == 'failure'
+        run: |
+          report="app/build/reports/lint-results-debug.txt"
+          if [[ -f "$report" ]]; then
+            while IFS= read -r line; do
+              if [[ "$line" == *" Error:"* ]]; then
+                echo "::error::$line"
+              fi
+            done < "$report"
+          fi
+          exit 1
 
       - name: Create checksum
         run: |
@@ -55,4 +76,3 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
-
