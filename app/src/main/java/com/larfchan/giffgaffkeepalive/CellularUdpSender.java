@@ -10,7 +10,6 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
-import android.telephony.TelephonyManager;
 
 import java.io.Closeable;
 import java.net.DatagramPacket;
@@ -19,6 +18,7 @@ import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class CellularUdpSender implements Closeable {
@@ -35,7 +35,6 @@ final class CellularUdpSender implements Closeable {
         final int port;
         final boolean usedDns;
         final boolean roaming;
-        final boolean reusedExistingCellular;
         final int theoreticalIpBytes;
         final long uidTxDelta;
         final long uidRxDelta;
@@ -45,7 +44,6 @@ final class CellularUdpSender implements Closeable {
                 int port,
                 boolean usedDns,
                 boolean roaming,
-                boolean reusedExistingCellular,
                 int theoreticalIpBytes,
                 long uidTxDelta,
                 long uidRxDelta
@@ -54,7 +52,6 @@ final class CellularUdpSender implements Closeable {
             this.port = port;
             this.usedDns = usedDns;
             this.roaming = roaming;
-            this.reusedExistingCellular = reusedExistingCellular;
             this.theoreticalIpBytes = theoreticalIpBytes;
             this.uidTxDelta = uidTxDelta;
             this.uidRxDelta = uidRxDelta;
@@ -64,7 +61,6 @@ final class CellularUdpSender implements Closeable {
     private static final int TRAFFIC_TAG = 0x474b;
     private static final long OVERALL_TIMEOUT_MS = 25_000L;
 
-    private final Context context;
     private final ConnectivityManager connectivityManager;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -72,7 +68,6 @@ final class CellularUdpSender implements Closeable {
     private volatile boolean closed;
 
     CellularUdpSender(Context context) {
-        this.context = context.getApplicationContext();
         this.connectivityManager =
                 (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
     }
@@ -95,30 +90,36 @@ final class CellularUdpSender implements Closeable {
         activeSession = session;
         mainHandler.postDelayed(session.timeoutRunnable, OVERALL_TIMEOUT_MS);
 
-        Network existing = findExistingCellularNetwork();
-        if (existing != null) {
-            session.networkClaimed.set(true);
-            postProgress(callback, "检测到已连接的蜂窝网络，准备发送…");
-            executor.execute(() -> sendOnNetwork(session, existing, true));
-            return;
-        }
-
-        postProgress(callback, "正在申请默认移动数据 SIM 的蜂窝网络…");
+        postProgress(session, "正在申请系统首选的非 VPN 蜂窝网络…");
         NetworkRequest request = new NetworkRequest.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
                 .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
                 .build();
 
         ConnectivityManager.NetworkCallback networkCallback =
                 new ConnectivityManager.NetworkCallback() {
                     @Override
                     public void onAvailable(Network network) {
-                        if (!session.networkClaimed.compareAndSet(false, true)
-                                || session.finished.get()) {
+                        if (session.finished.get()) {
                             return;
                         }
-                        postProgress(callback, "蜂窝网络已就绪，准备发送…");
-                        executor.execute(() -> sendOnNetwork(session, network, false));
+                        postProgress(session, "已发现蜂窝网络，正在确认网络能力…");
+                    }
+
+                    @Override
+                    public void onCapabilitiesChanged(
+                            Network network,
+                            NetworkCapabilities capabilities
+                    ) {
+                        if (session.finished.get()
+                                || !isExpectedCellularCapabilities(capabilities)
+                                || !session.networkClaimed.compareAndSet(false, true)
+                        ) {
+                            return;
+                        }
+                        postProgress(session, "已确认非 VPN 蜂窝网络，准备提交负载…");
+                        executeSend(session, network);
                     }
 
                     @Override
@@ -142,32 +143,42 @@ final class CellularUdpSender implements Closeable {
         }
     }
 
-    private Network findExistingCellularNetwork() {
-        Network fallback = null;
-        try {
-            for (Network network : connectivityManager.getAllNetworks()) {
-                NetworkCapabilities capabilities =
-                        connectivityManager.getNetworkCapabilities(network);
-                if (capabilities == null
-                        || !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
-                        || !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
-                    continue;
-                }
-                if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
-                    return network;
-                }
-                if (fallback == null) {
-                    fallback = network;
-                }
-            }
-        } catch (RuntimeException ignored) {
-            return null;
+    private void executeSend(SendSession session, Network network) {
+        if (closed || session.finished.get()) {
+            session.cancelSilently();
+            return;
         }
-        return fallback;
+        try {
+            executor.execute(() -> sendOnNetwork(session, network));
+        } catch (RejectedExecutionException exception) {
+            session.cancelSilently();
+        }
     }
 
-    private void sendOnNetwork(SendSession session, Network network, boolean reusedExisting) {
+    private boolean isExpectedCellularNetwork(Network network) {
+        if (network == null) {
+            return false;
+        }
+        NetworkCapabilities capabilities =
+                connectivityManager.getNetworkCapabilities(network);
+        return isExpectedCellularCapabilities(capabilities);
+    }
+
+    private static boolean isExpectedCellularCapabilities(
+            NetworkCapabilities capabilities
+    ) {
+        return capabilities != null
+                && capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN);
+    }
+
+    private void sendOnNetwork(SendSession session, Network network) {
         if (session.finished.get()) {
+            return;
+        }
+        if (!isExpectedCellularNetwork(network)) {
+            session.fail("系统提供的网络不是预期的非 VPN 蜂窝网络，因此未提交负载。");
             return;
         }
 
@@ -187,7 +198,7 @@ final class CellularUdpSender implements Closeable {
         try {
             InetAddress destination = session.target.numericAddress;
             if (destination == null) {
-                postProgress(session.callback, "正在通过蜂窝网络解析主机名（会产生 DNS 流量）…");
+                postProgress(session, "正在通过蜂窝网络解析主机名（会产生 DNS 流量）…");
                 InetAddress[] addresses = network.getAllByName(session.target.host);
                 destination = AddressPolicy.selectPublicInternetAddress(addresses);
             }
@@ -196,10 +207,13 @@ final class CellularUdpSender implements Closeable {
                 return;
             }
 
-            postProgress(session.callback, "正在发送唯一的 1 字节 UDP 包…");
+            postProgress(session, "正在提交含 1 字节应用负载的 UDP 数据报…");
             try (DatagramSocket socket = new DatagramSocket()) {
                 network.bindSocket(socket);
                 socket.connect(destination, session.target.port);
+                if (!session.beginIrreversibleSend()) {
+                    return;
+                }
                 byte[] payload = new byte[]{0x47};
                 socket.send(new DatagramPacket(payload, payload.length));
             }
@@ -213,7 +227,6 @@ final class CellularUdpSender implements Closeable {
                     session.target.port,
                     session.target.usesDns(),
                     Boolean.TRUE.equals(roaming),
-                    reusedExisting,
                     theoreticalBytes,
                     delta(txBefore, txAfter),
                     delta(rxBefore, rxAfter)
@@ -238,9 +251,10 @@ final class CellularUdpSender implements Closeable {
                 return !capabilities.hasCapability(
                         NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING);
             }
-            TelephonyManager telephonyManager =
-                    (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
-            return telephonyManager == null ? null : telephonyManager.isNetworkRoaming();
+            @SuppressWarnings("deprecation")
+            android.net.NetworkInfo networkInfo =
+                    connectivityManager.getNetworkInfo(network);
+            return networkInfo == null ? null : networkInfo.isRoaming();
         } catch (RuntimeException exception) {
             return null;
         }
@@ -264,11 +278,11 @@ final class CellularUdpSender implements Closeable {
                 : message;
     }
 
-    private void postProgress(Callback callback, String message) {
+    private void postProgress(SendSession expectedSession, String message) {
         mainHandler.post(() -> {
             SendSession session = activeSession;
-            if (session != null && !session.finished.get()) {
-                callback.onProgress(message);
+            if (!closed && session == expectedSession && !session.finished.get()) {
+                session.callback.onProgress(message);
             }
         });
     }
@@ -280,6 +294,7 @@ final class CellularUdpSender implements Closeable {
         if (session != null) {
             session.cancelSilently();
         }
+        mainHandler.removeCallbacksAndMessages(null);
         executor.shutdownNow();
     }
 
@@ -290,10 +305,11 @@ final class CellularUdpSender implements Closeable {
         final AtomicBoolean networkClaimed = new AtomicBoolean(false);
         final AtomicBoolean finished = new AtomicBoolean(false);
         final Runnable timeoutRunnable =
-                () -> fail("操作超时，未发送。请检查默认数据 SIM、移动数据和漫游设置。");
+                this::timeout;
 
         volatile ConnectivityManager.NetworkCallback networkCallback;
         volatile boolean callbackRegistered;
+        private boolean sendStarted;
 
         SendSession(TargetSpec target, boolean requireRoaming, Callback callback) {
             this.target = target;
@@ -310,26 +326,57 @@ final class CellularUdpSender implements Closeable {
         }
 
         void cancelSilently() {
-            finish(null);
+            synchronized (this) {
+                if (sendStarted) {
+                    return;
+                }
+                finish(null);
+            }
+        }
+
+        boolean beginIrreversibleSend() {
+            synchronized (this) {
+                if (finished.get()) {
+                    return false;
+                }
+                sendStarted = true;
+                mainHandler.removeCallbacks(timeoutRunnable);
+                return true;
+            }
+        }
+
+        private void timeout() {
+            synchronized (this) {
+                if (sendStarted || finished.get()) {
+                    return;
+                }
+                fail("操作超时，1 字节应用负载未提交。请检查默认数据 SIM、移动数据和漫游设置。");
+            }
         }
 
         private void finish(Runnable completion) {
-            if (!finished.compareAndSet(false, true)) {
-                return;
-            }
-            mainHandler.removeCallbacks(timeoutRunnable);
-            if (callbackRegistered && networkCallback != null) {
-                try {
-                    connectivityManager.unregisterNetworkCallback(networkCallback);
-                } catch (RuntimeException ignored) {
-                    // The system may already have released a timed-out request.
+            synchronized (this) {
+                if (!finished.compareAndSet(false, true)) {
+                    return;
+                }
+                mainHandler.removeCallbacks(timeoutRunnable);
+                if (callbackRegistered && networkCallback != null) {
+                    try {
+                        connectivityManager.unregisterNetworkCallback(networkCallback);
+                    } catch (RuntimeException ignored) {
+                        // The system may already have released a timed-out request.
+                    }
+                }
+                if (activeSession == this) {
+                    activeSession = null;
                 }
             }
-            if (activeSession == this) {
-                activeSession = null;
-            }
-            if (completion != null && !closed) {
-                mainHandler.post(completion);
+            if (completion != null) {
+                mainHandler.post(() -> {
+                    if (!closed) {
+                        completion.run();
+                    }
+                });
             }
         }
     }

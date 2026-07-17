@@ -16,6 +16,7 @@
 
         <activity
             android:name=".MainActivity"
+            android:configChanges="keyboardHidden|orientation|screenSize"
             android:exported="true"
             android:screenOrientation="unspecified">
             <intent-filter>
@@ -28,4 +29,3 @@
     </application>
 
 </manifest>
-
