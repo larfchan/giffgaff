@@ -5,11 +5,8 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
-import android.net.TrafficStats;
-import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.Process;
 
 import java.io.Closeable;
 import java.net.DatagramPacket;
@@ -27,38 +24,28 @@ final class CellularUdpSender implements Closeable {
 
         void onSuccess(Result result);
 
-        void onError(String message);
+        void onError(String message, boolean outcomeUnknown);
     }
 
     static final class Result {
         final InetAddress destination;
         final int port;
-        final boolean usedDns;
-        final boolean roaming;
+        final int applicationBytes;
         final int theoreticalIpBytes;
-        final long uidTxDelta;
-        final long uidRxDelta;
 
         Result(
                 InetAddress destination,
                 int port,
-                boolean usedDns,
-                boolean roaming,
-                int theoreticalIpBytes,
-                long uidTxDelta,
-                long uidRxDelta
+                int applicationBytes,
+                int theoreticalIpBytes
         ) {
             this.destination = destination;
             this.port = port;
-            this.usedDns = usedDns;
-            this.roaming = roaming;
+            this.applicationBytes = applicationBytes;
             this.theoreticalIpBytes = theoreticalIpBytes;
-            this.uidTxDelta = uidTxDelta;
-            this.uidRxDelta = uidRxDelta;
         }
     }
 
-    private static final int TRAFFIC_TAG = 0x474b;
     private static final long OVERALL_TIMEOUT_MS = 25_000L;
 
     private final ConnectivityManager connectivityManager;
@@ -72,21 +59,21 @@ final class CellularUdpSender implements Closeable {
                 (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
     }
 
-    void send(TargetSpec target, boolean requireRoaming, Callback callback) {
+    void send(TargetSpec target, Callback callback) {
         if (closed) {
-            callback.onError("发送器已经关闭，请重新打开应用");
+            callback.onError("发送器已经关闭，请重新打开应用", false);
             return;
         }
         if (connectivityManager == null) {
-            callback.onError("此设备没有可用的网络管理服务");
+            callback.onError("此设备没有可用的网络管理服务", false);
             return;
         }
         if (activeSession != null) {
-            callback.onError("已有一次发送正在进行");
+            callback.onError("已有一次发送正在进行", false);
             return;
         }
 
-        SendSession session = new SendSession(target, requireRoaming, callback);
+        SendSession session = new SendSession(target, callback);
         activeSession = session;
         mainHandler.postDelayed(session.timeoutRunnable, OVERALL_TIMEOUT_MS);
 
@@ -118,7 +105,7 @@ final class CellularUdpSender implements Closeable {
                         ) {
                             return;
                         }
-                        postProgress(session, "已确认非 VPN 蜂窝网络，准备提交负载…");
+                        postProgress(session, "已确认非 VPN 蜂窝网络，准备提交 DNS 查询…");
                         executeSend(session, network);
                     }
 
@@ -182,93 +169,34 @@ final class CellularUdpSender implements Closeable {
             return;
         }
 
-        Boolean roaming = readRoamingState(network);
-        if (session.requireRoaming && !Boolean.TRUE.equals(roaming)) {
-            String detail = roaming == null
-                    ? "系统无法确认当前蜂窝网络是否处于漫游"
-                    : "系统报告当前蜂窝网络不是漫游网络";
-            session.fail(detail + "，因此未发送。可在确认设置无误后关闭“仅漫游时发送”。");
-            return;
-        }
-
-        TrafficStats.setThreadStatsTag(TRAFFIC_TAG);
-        long txBefore = readUidBytes(true);
-        long rxBefore = readUidBytes(false);
-
         try {
             InetAddress destination = session.target.numericAddress;
-            if (destination == null) {
-                postProgress(session, "正在通过蜂窝网络解析主机名（会产生 DNS 流量）…");
-                InetAddress[] addresses = network.getAllByName(session.target.host);
-                destination = AddressPolicy.selectPublicInternetAddress(addresses);
-            }
 
-            if (session.finished.get()) {
-                return;
-            }
-
-            postProgress(session, "正在提交含 1 字节应用负载的 UDP 数据报…");
+            byte[] payload = DnsQuery.rootA();
+            postProgress(session, "正在提交 " + payload.length + " 字节 DNS 查询…");
             try (DatagramSocket socket = new DatagramSocket()) {
                 network.bindSocket(socket);
                 socket.connect(destination, session.target.port);
                 if (!session.beginIrreversibleSend()) {
                     return;
                 }
-                byte[] payload = new byte[]{0x47};
                 socket.send(new DatagramPacket(payload, payload.length));
             }
 
-            long txAfter = readUidBytes(true);
-            long rxAfter = readUidBytes(false);
-            int theoreticalBytes = destination instanceof Inet4Address ? 29 : 49;
+            int theoreticalBytes = (destination instanceof Inet4Address ? 28 : 48)
+                    + payload.length;
 
             session.succeed(new Result(
                     destination,
                     session.target.port,
-                    session.target.usesDns(),
-                    Boolean.TRUE.equals(roaming),
-                    theoreticalBytes,
-                    delta(txBefore, txAfter),
-                    delta(rxBefore, rxAfter)
+                    payload.length,
+                    theoreticalBytes
             ));
         } catch (IllegalArgumentException exception) {
-            session.fail(exception.getMessage());
+            session.fail(exception.getMessage(), session.hasSendStarted());
         } catch (Exception exception) {
-            session.fail("未能发送：" + safeMessage(exception));
-        } finally {
-            TrafficStats.clearThreadStatsTag();
+            session.fail("未能发送：" + safeMessage(exception), session.hasSendStarted());
         }
-    }
-
-    private Boolean readRoamingState(Network network) {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                NetworkCapabilities capabilities =
-                        connectivityManager.getNetworkCapabilities(network);
-                if (capabilities == null) {
-                    return null;
-                }
-                return !capabilities.hasCapability(
-                        NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING);
-            }
-            @SuppressWarnings("deprecation")
-            android.net.NetworkInfo networkInfo =
-                    connectivityManager.getNetworkInfo(network);
-            return networkInfo == null ? null : networkInfo.isRoaming();
-        } catch (RuntimeException exception) {
-            return null;
-        }
-    }
-
-    private static long readUidBytes(boolean transmitted) {
-        long value = transmitted
-                ? TrafficStats.getUidTxBytes(Process.myUid())
-                : TrafficStats.getUidRxBytes(Process.myUid());
-        return value == TrafficStats.UNSUPPORTED ? -1L : value;
-    }
-
-    private static long delta(long before, long after) {
-        return before >= 0L && after >= before ? after - before : -1L;
     }
 
     private static String safeMessage(Throwable throwable) {
@@ -300,7 +228,6 @@ final class CellularUdpSender implements Closeable {
 
     private final class SendSession {
         final TargetSpec target;
-        final boolean requireRoaming;
         final Callback callback;
         final AtomicBoolean networkClaimed = new AtomicBoolean(false);
         final AtomicBoolean finished = new AtomicBoolean(false);
@@ -311,9 +238,8 @@ final class CellularUdpSender implements Closeable {
         volatile boolean callbackRegistered;
         private boolean sendStarted;
 
-        SendSession(TargetSpec target, boolean requireRoaming, Callback callback) {
+        SendSession(TargetSpec target, Callback callback) {
             this.target = target;
-            this.requireRoaming = requireRoaming;
             this.callback = callback;
         }
 
@@ -322,7 +248,11 @@ final class CellularUdpSender implements Closeable {
         }
 
         void fail(String message) {
-            finish(() -> callback.onError(message));
+            fail(message, false);
+        }
+
+        void fail(String message, boolean outcomeUnknown) {
+            finish(() -> callback.onError(message, outcomeUnknown));
         }
 
         void cancelSilently() {
@@ -345,12 +275,16 @@ final class CellularUdpSender implements Closeable {
             }
         }
 
+        synchronized boolean hasSendStarted() {
+            return sendStarted;
+        }
+
         private void timeout() {
             synchronized (this) {
                 if (sendStarted || finished.get()) {
                     return;
                 }
-                fail("操作超时，1 字节应用负载未提交。请检查默认数据 SIM、移动数据和漫游设置。");
+                fail("操作超时，DNS 查询未提交。请检查默认数据 SIM、移动数据和漫游设置。");
             }
         }
 

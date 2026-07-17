@@ -165,7 +165,8 @@ final class AddressPolicy {
                 return false;
             }
             for (int index = 0; index < part.length(); index++) {
-                if (!Character.isDigit(part.charAt(index))) {
+                char character = part.charAt(index);
+                if (character < '0' || character > '9') {
                     return false;
                 }
             }
